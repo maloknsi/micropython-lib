@@ -46,7 +46,7 @@ _STATUS_NOT_IMPLEMENTED = const(1)
 _STATUS_NOT_FOUND = const(2)
 
 _L2CAP_PSN = const(22)
-_L2CAP_MTU = const(128)
+_L2CAP_MTU = const(512)
 
 
 # Register GATT server.
@@ -64,9 +64,12 @@ op_seq = None
 l2cap_event = asyncio.Event()
 
 
-def send_done_notification(connection, status=_STATUS_OK):
+def send_done_notification(connection, status=_STATUS_OK, data=None):
     global op_seq
-    control_characteristic.notify(connection, struct.pack("<BBB", _COMMAND_DONE, op_seq, status))
+    payload = struct.pack("<BBB", _COMMAND_DONE, op_seq, status)
+    if data:
+        payload += data
+    control_characteristic.notify(connection, payload)
     op_seq = None
 
 
@@ -80,31 +83,38 @@ async def l2cap_task(connection):
             await l2cap_event.wait()
             l2cap_event.clear()
 
+            status = _STATUS_OK
+
             if send_file:
                 print("Sending:", send_file)
-                with open(send_file, "rb") as f:
-                    buf = bytearray(channel.peer_mtu)
-                    mv = memoryview(buf)
-                    while n := f.readinto(buf):
-                        await channel.send(mv[:n])
-                await channel.flush()
-                send_done_notification(connection)
+                try:
+                    with open(send_file, "rb") as f:
+                        buf = bytearray(40)#channel.peer_mtu)
+                        mv = memoryview(buf)
+                        while n := f.readinto(buf):
+                            await channel.send(mv[:n])
+                    await channel.flush()
+                except OSError:
+                    status = _STATUS_NOT_FOUND
                 send_file = None
-            if recv_file:
+            elif recv_file:
                 print("Receiving:", recv_file)
-                send_done_notification(connection, _STATUS_NOT_IMPLEMENTED)
+                status = _STATUS_NOT_IMPLEMENTED
                 recv_file = None
-            if list_path:
+            elif list_path:
                 print("List:", list_path)
                 try:
-                    for name, _, _, size in os.ilistdir(list_path):
-                        await channel.send("{}:{}\n".format(size, name))
+                    for x in os.ilistdir(list_path):
+                        name = x[0]
+                        size = os.stat(list_path + '/' + name)[6]
+                        await channel.send("{}:{}\n".format(size, x[0]))
                     await channel.send("\n")
                     await channel.flush()
-                    send_done_notification(connection)
                 except OSError:
-                    send_done_notification(connection, _STATUS_NOT_FOUND)
+                    status = _STATUS_NOT_FOUND
                 list_path = None
+
+            send_done_notification(connection, status=status)
 
     except aioble.DeviceDisconnectedError:
         print("Stopping l2cap")
@@ -112,7 +122,7 @@ async def l2cap_task(connection):
 
 
 async def control_task(connection):
-    global send_file, recv_file, list_path
+    global send_file, recv_file, list_path, op_seq
 
     try:
         with connection.timeout(None):
@@ -128,32 +138,30 @@ async def control_task(connection):
                 # Message is <command><seq><path...>.
 
                 command = msg[0]
-                seq = msg[1]
+                op_seq = msg[1]
                 file = msg[2:].decode()
 
                 if command == _COMMAND_SEND:
-                    op_seq = seq
                     send_file = file
                     l2cap_event.set()
                 elif command == _COMMAND_RECV:
-                    op_seq = seq
                     recv_file = file
                     l2cap_event.set()
                 elif command == _COMMAND_LIST:
-                    op_seq = seq
                     list_path = file
                     l2cap_event.set()
                 elif command == _COMMAND_SIZE:
+                    status = _STATUS_OK
                     try:
                         stat = os.stat(file)
                         size = stat[6]
-                        status = 0
                     except OSError as e:
                         size = 0
                         status = _STATUS_NOT_FOUND
-                    control_characteristic.notify(
-                        connection, struct.pack("<BBI", seq, status, size)
-                    )
+                    send_done_notification(connection, status=status, data=struct.pack("<I", size))
+                else:
+                    send_done_notification(connection, status=_STATUS_NOT_IMPLEMENTED)
+
     except aioble.DeviceDisconnectedError:
         return
 

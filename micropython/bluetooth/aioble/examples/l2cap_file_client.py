@@ -15,9 +15,10 @@ import bluetooth
 
 import random
 import struct
+import time
 
-_FILE_SERVICE_UUID = bluetooth.UUID(0x1234)
-_CONTROL_CHARACTERISTIC_UUID = bluetooth.UUID(0x1235)
+_FILE_SERVICE_UUID = bluetooth.UUID("0492fcec-7194-11eb-9439-0242ac130002")
+_CONTROL_CHARACTERISTIC_UUID = bluetooth.UUID("0492fcec-7194-11eb-9439-0242ac130003")
 
 
 _COMMAND_SEND = const(0)
@@ -31,7 +32,11 @@ _STATUS_NOT_IMPLEMENTED = const(1)
 _STATUS_NOT_FOUND = const(2)
 
 _L2CAP_PSN = const(22)
-_L2CAP_MTU = const(128)
+_L2CAP_MTU = const(512)
+
+
+class FileError(Exception):
+    pass
 
 
 class FileClient:
@@ -72,15 +77,23 @@ class FileClient:
         send_seq = await self._command(_COMMAND_SIZE, path.encode())
 
         data = await self._control_characteristic.notified()
-        if len(data) != 6:
-            raise RuntimeError("Invalid response")
+        if len(data) != 3 and len(data) != 7:
+            raise FileError("Invalid response")
 
-        seq, status, size = struct.unpack("<BBI", data)
+        cmd, seq, status = struct.unpack("<BBB", data[0:3])
         if seq != send_seq:
-            raise RuntimeError("Wrong reply")
+            raise FileError("Wrong reply")
 
-        print("result:", seq, status, size)
-        return size
+        if status == _STATUS_OK:
+            size = struct.unpack('<I', data[3:])[0]
+            print("result:", seq, status, size)
+            return size
+
+        if status == _STATUS_NOT_FOUND:
+            raise FileError("Not found")
+        else:
+            raise FileError("Unknown")
+
 
     async def download(self, path, dest):
         size = await self.size(path)
@@ -98,15 +111,21 @@ class FileClient:
 
     async def list(self, path):
         send_seq = await self._command(_COMMAND_LIST, path.encode())
-        results = bytearray()
+        data = bytearray()
         buf = bytearray(self._channel.our_mtu)
         mv = memoryview(buf)
         while True:
             n = await self._channel.recvinto(buf)
-            results += mv[:n]
-            if results[len(results) - 1] == ord("\n") and results[len(results) - 2] == ord("\n"):
+            data += mv[:n]
+            if data[len(data) - 1] == ord("\n") and data[len(data) - 2] == ord("\n"):
                 break
-        print(results.decode().split("\n"))
+        results = []
+        for entry in data.decode().split("\n"):
+            entry = entry.split(':')
+            if len(entry) != 2:
+                continue
+            results.append((int(entry[0]), entry[1]))
+        return results
 
     async def disconnect(self):
         if self._connection:
@@ -126,12 +145,21 @@ async def main():
     client = FileClient(device)
 
     await client.connect()
-    print(await client.size("demo/file.txt"))
-    print(await client.size("demo/notfound.bin"))
+    print(await client.size("/tmp/demo/file.txt"))
 
-    await client.download("demo/file.txt", "download.txt")
+    try:
+        print(await client.size("/tmp/demo/notfound.bin"))
+    except FileError:
+        print("Not found")
 
-    await client.list("demo")
+    s = await client.size("/tmp/demo/big.dat")
+    t = time.ticks_ms()
+    await client.download("/tmp/demo/big.dat", "/tmp/download.txt")
+    dt = time.ticks_diff(time.ticks_ms(), t)
+    print("Download took {}ms ({} b/s).".format(dt, int(s*1000/dt)))
+
+    for f in await client.list("/tmp/demo"):
+        print(f)
 
     await client.disconnect()
 
