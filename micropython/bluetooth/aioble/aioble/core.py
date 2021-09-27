@@ -4,7 +4,7 @@
 import bluetooth
 
 
-log_level = 1
+log_level = 2
 
 
 def log_error(*args):
